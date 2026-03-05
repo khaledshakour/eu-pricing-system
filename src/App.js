@@ -134,29 +134,137 @@ function analyzeAndPrice(text) {
   const lines = text.split(/\n/).filter(l => l.trim());
   const sections = [];
   let cur = { name: "General", items: [] };
-  lines.forEach(line => {
-    const l = line.trim();
-    if (!l) return;
-    if (/^[A-Z][A-Z\s&\-]{4,}$/.test(l) || /^(Security|CCTV|ACCESS|Intercom|Fire|PA |Conduit|Guard|Electrical)/i.test(l)) {
-      if (cur.items.length > 0) sections.push(cur);
-      cur = { name: l, items: [] };
-      return;
-    }
-    const parts = l.split(/[\t,;|]+/).map(p => p.trim()).filter(Boolean);
-    let desc = parts[0]?.replace(/^(Low Current|Electrical)\s*/i, "").trim() || l;
-    let qty = 1;
-    parts.forEach(p => { const n = parseFloat(p); if (!isNaN(n) && n > 0 && n < 10000 && p === String(n)) qty = n; });
-    const match = matchItemFromDB(desc);
-    if (desc.length > 2) {
-      cur.items.push({
-        id: `i-${Date.now()}-${Math.random().toString(36).substr(2,4)}`,
-        description: desc, descriptionAr: match?.nameAr || "", qty,
-        unit: match?.unit || "Each", unitPrice: match?.price || 0,
-        matched: !!match, dbId: match?.id || null,
+
+  // Step 1: Detect if this is structured CSV/Excel data with headers
+  const headerPatterns = [
+    /item\s*(description|part|no)/i,
+    /description.*unit.*qty/i,
+    /ITEM.*Part\s*No/i,
+    /qty.*unit\s*price/i,
+    /الوصف.*الكمية/,
+  ];
+  
+  let hasHeaders = false;
+  let headerLineIdx = -1;
+  let colMap = { item: -1, partNo: -1, desc: -1, unit: -1, qty: -1, unitPrice: -1, totalPrice: -1, remarks: -1 };
+
+  // Find header row and map columns
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    if (headerPatterns.some(p => p.test(lines[i]))) {
+      hasHeaders = true;
+      headerLineIdx = i;
+      const cols = lines[i].split(",").map(c => c.trim().toLowerCase());
+      cols.forEach((c, idx) => {
+        if (/^item$|^#$|^رقم/.test(c)) colMap.item = idx;
+        else if (/part\s*no|item\s*part|رقم القطعة/.test(c)) colMap.partNo = idx;
+        else if (/desc|الوصف|item\s*desc/.test(c)) colMap.desc = idx;
+        else if (/^unit$|الوحدة|وحدة/.test(c)) colMap.unit = idx;
+        else if (/^qty$|الكمية|quantity/.test(c)) colMap.qty = idx;
+        else if (/unit\s*price|سعر الوحدة/.test(c)) colMap.unitPrice = idx;
+        else if (/total\s*price|الإجمالي|amount/.test(c)) colMap.totalPrice = idx;
+        else if (/remark|ملاحظ/.test(c)) colMap.remarks = idx;
       });
+      break;
     }
-  });
+  }
+
+  // Step 2: Parse lines
+  const startLine = hasHeaders ? headerLineIdx + 1 : 0;
+
+  for (let i = startLine; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (!l || /^[\s,]+$/.test(l)) continue;
+
+    // Skip summary/total rows
+    if (/^total|^المجموع|^الإجمالي/i.test(l)) continue;
+
+    const parts = l.split(",").map(p => p.trim());
+
+    // Detect section headers: "Scope:" lines or all-caps text
+    if (/^scope\s*:/i.test(l) || (/^[A-Z][A-Z\s&\-\/]{4,}$/.test(parts[0] || "") && !parts[1]) ||
+        (parts.length <= 2 && !parts.some(p => /^\d+\.?\d*$/.test(p)) && (parts[0]||"").length > 5 && !/^\d/.test(parts[0]||""))) {
+      if (cur.items.length > 0) sections.push(cur);
+      const sectionName = l.replace(/^scope\s*:\s*/i, "").replace(/,+/g, " ").trim();
+      if (sectionName.length > 2) cur = { name: sectionName, items: [] };
+      continue;
+    }
+
+    // Try structured parsing with column map
+    if (hasHeaders && parts.length >= 3) {
+      const descCol = colMap.desc >= 0 ? colMap.desc : (colMap.partNo >= 0 ? colMap.partNo + 1 : 2);
+      const desc = (parts[descCol] || "").trim();
+      
+      // Skip sub-description lines (start with "- " and no item number)
+      if (/^-\s/.test(desc) || /^-\s/.test(parts[0])) {
+        // Append to previous item description if exists
+        if (cur.items.length > 0) {
+          cur.items[cur.items.length - 1].description += " | " + desc.replace(/^-\s*/, "");
+        }
+        continue;
+      }
+
+      const partNo = colMap.partNo >= 0 ? (parts[colMap.partNo] || "").trim() : "";
+      const unit = colMap.unit >= 0 ? (parts[colMap.unit] || "Each").trim() : "Each";
+      
+      let qty = 1;
+      if (colMap.qty >= 0) {
+        const qVal = parseFloat(parts[colMap.qty]);
+        if (!isNaN(qVal) && qVal > 0) qty = qVal;
+      }
+
+      let unitPrice = 0;
+      if (colMap.unitPrice >= 0) {
+        const pVal = parseFloat((parts[colMap.unitPrice] || "").replace(/[^0-9.]/g, ""));
+        if (!isNaN(pVal)) unitPrice = pVal;
+      }
+
+      // Skip empty/header-like rows
+      if (!desc || desc.length < 2 || /^item$|^ITEM$/i.test(desc)) continue;
+      // Skip currency label rows
+      if (/^BHD|^SAR|^USD/i.test(desc)) continue;
+
+      const match = matchItemFromDB(desc);
+      const displayDesc = partNo ? `${desc} (${partNo})` : desc;
+
+      cur.items.push({
+        id: `i-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        description: displayDesc,
+        descriptionAr: match?.nameAr || "",
+        qty: qty,
+        unit: unit === "EA" ? "Each" : unit,
+        unitPrice: unitPrice > 0 ? unitPrice : (match?.price || 0),
+        matched: !!match,
+        dbId: match?.id || null,
+        partNo: partNo,
+      });
+    } else {
+      // Fallback: unstructured text parsing
+      if (/^[A-Z][A-Z\s&\-]{4,}$/.test(l) || /^(Security|CCTV|ACCESS|Intercom|Fire|PA |Conduit|Guard|Electrical)/i.test(l)) {
+        if (cur.items.length > 0) sections.push(cur);
+        cur = { name: l, items: [] };
+        continue;
+      }
+      let desc = parts[0]?.replace(/^(Low Current|Electrical)\s*/i, "").trim() || l;
+      let qty = 1;
+      parts.forEach(p => { const n = parseFloat(p); if (!isNaN(n) && n > 0 && n < 100000 && p === String(n)) qty = n; });
+      const match = matchItemFromDB(desc);
+      if (desc.length > 2 && !/^[\d.]+$/.test(desc)) {
+        cur.items.push({
+          id: `i-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+          description: desc, descriptionAr: match?.nameAr || "", qty,
+          unit: match?.unit || "Each", unitPrice: match?.price || 0,
+          matched: !!match, dbId: match?.id || null,
+        });
+      }
+    }
+  }
   if (cur.items.length > 0) sections.push(cur);
+
+  // If no sections found, put all in General
+  if (sections.length === 0 && cur.items.length === 0) {
+    sections.push({ name: "General", items: [{ id: "empty", description: "لم يتم العثور على بنود - يرجى التأكد من صيغة الملف", descriptionAr: "", qty: 0, unit: "Each", unitPrice: 0, matched: false }] });
+  }
+
   return { sections };
 }
 
@@ -204,6 +312,88 @@ function PricingTab() {
   const fileRef = useRef(null);
   const resRef = useRef(null);
 
+  const [fileStatus, setFileStatus] = useState(""); // "", "loading", "done", "error"
+  const [fileName, setFileName] = useState("");
+
+  // Load external library via script tag
+  const loadScript = (url) => new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${url}"]`);
+    if (existing) { resolve(); return; }
+    const s = document.createElement("script");
+    s.src = url;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("فشل تحميل المكتبة"));
+    document.head.appendChild(s);
+  });
+
+  const handleFileUpload = async (file) => {
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    setFileName(file.name);
+    setFileStatus("loading");
+    setInputText("");
+
+    try {
+      const reader = new FileReader();
+      
+      if (name.endsWith(".csv") || name.endsWith(".txt") || name.endsWith(".md")) {
+        reader.onload = (ev) => { setInputText(ev.target.result); setFileStatus("done"); };
+        reader.readAsText(file, "UTF-8");
+      }
+      else if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+        reader.onload = async (ev) => {
+          try {
+            await loadScript("https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js");
+            const X = window.XLSX;
+            const wb = X.read(new Uint8Array(ev.target.result), { type: "array" });
+            let t = "";
+            wb.SheetNames.forEach(s => { t += X.utils.sheet_to_csv(wb.Sheets[s]) + "\n"; });
+            setInputText(t);
+            setFileStatus("done");
+          } catch (err) { setFileStatus("error"); alert("خطأ في قراءة Excel: " + err.message); }
+        };
+        reader.readAsArrayBuffer(file);
+      }
+      else if (name.endsWith(".pdf")) {
+        reader.onload = async (ev) => {
+          try {
+            await loadScript("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js");
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+            const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(ev.target.result) }).promise;
+            let allText = "";
+            for (let i = 1; i <= pdf.numPages; i++) {
+              const page = await pdf.getPage(i);
+              const content = await page.getTextContent();
+              allText += content.items.map(item => item.str).join(" ") + "\n";
+            }
+            setInputText(allText);
+            setFileStatus("done");
+          } catch (err) { setFileStatus("error"); alert("خطأ في قراءة PDF: " + err.message); }
+        };
+        reader.readAsArrayBuffer(file);
+      }
+      else if (name.endsWith(".docx")) {
+        reader.onload = async (ev) => {
+          try {
+            await loadScript("https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js");
+            const result = await window.mammoth.extractRawText({ arrayBuffer: ev.target.result });
+            setInputText(result.value);
+            setFileStatus("done");
+          } catch (err) { setFileStatus("error"); alert("خطأ في قراءة Word: " + err.message); }
+        };
+        reader.readAsArrayBuffer(file);
+      }
+      else {
+        // Try reading as text for any other file
+        reader.onload = (ev) => { setInputText(ev.target.result); setFileStatus("done"); };
+        reader.readAsText(file, "UTF-8");
+      }
+    } catch (err) {
+      setFileStatus("error");
+      alert("خطأ: " + err.message);
+    }
+  };
+
   const handleAnalyze = () => {
     if (!inputText.trim()) return;
     setLoading(true);
@@ -222,6 +412,15 @@ function PricingTab() {
     return { sub, mar, bv, vat: v, total: bv + v };
   })();
 
+  const getFileIcon = (n) => {
+    if (!n) return "📄";
+    const ext = n.split(".").pop().toLowerCase();
+    if (ext === "pdf") return "📕";
+    if (["xlsx", "xls", "csv"].includes(ext)) return "📊";
+    if (["docx", "doc"].includes(ext)) return "📘";
+    return "📄";
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       {/* Input */}
@@ -231,36 +430,43 @@ function PricingTab() {
           <span style={{ fontSize: 14, fontWeight: 700, color: S.dark, fontFamily: S.font }}>إدخال BOQ أو وصف المشروع</span>
         </div>
         <div style={{ padding: 18 }}>
-          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.txt" style={{ display: "none" }} onChange={e => {
-            const f = e.target.files?.[0]; if (!f) return;
-            const r = new FileReader();
-            if (f.name.match(/\.csv|\.txt/)) { r.onload = ev => setInputText(ev.target.result); r.readAsText(f); }
-            else {
-              r.onload = async ev => {
-                try {
-                  // Load SheetJS via script tag (compatible with CRA build)
-                  if (!window.XLSX) {
-                    await new Promise((resolve, reject) => {
-                      const s = document.createElement("script");
-                      s.src = "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js";
-                      s.onload = resolve;
-                      s.onerror = () => reject(new Error("Failed to load Excel library"));
-                      document.head.appendChild(s);
-                    });
-                  }
-                  const X = window.XLSX;
-                  const wb = X.read(new Uint8Array(ev.target.result), { type: "array" });
-                  let t = "";
-                  wb.SheetNames.forEach(s => { t += X.utils.sheet_to_csv(wb.Sheets[s]) + "\n"; });
-                  setInputText(t);
-                } catch(err) { alert("خطأ: " + err.message); }
-              };
-              r.readAsArrayBuffer(f);
-            }
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.txt,.pdf,.docx,.doc,.md" style={{ display: "none" }} onChange={e => {
+            handleFileUpload(e.target.files?.[0]);
             e.target.value = "";
           }} />
-          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-            <button onClick={() => fileRef.current?.click()} style={{ padding: "7px 14px", background: `${S.gold}12`, border: `1px solid ${S.gold}40`, borderRadius: 8, color: S.gold, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: S.font }}>📎 رفع ملف (Excel/CSV)</button>
+          
+          {/* File upload area */}
+          <div style={{ marginBottom: 14 }}>
+            <div onClick={() => fileRef.current?.click()} style={{
+              border: `2px dashed ${fileStatus === "done" ? S.green : S.gl}`,
+              borderRadius: 10, padding: fileStatus ? "12px 16px" : "24px 16px",
+              textAlign: "center", cursor: "pointer", transition: "all 0.2s",
+              background: fileStatus === "done" ? "#f0faf1" : fileStatus === "loading" ? "#fffbf0" : "#f9fafb",
+            }}>
+              {fileStatus === "loading" ? (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+                  <div style={{ width: 18, height: 18, border: `2px solid ${S.gold}40`, borderTopColor: S.gold, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                  <span style={{ fontSize: 13, fontWeight: 600, color: S.gold, fontFamily: S.font }}>جاري قراءة {fileName}...</span>
+                </div>
+              ) : fileStatus === "done" ? (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+                  <span style={{ fontSize: 20 }}>{getFileIcon(fileName)}</span>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: S.green, fontFamily: S.font }}>✅ تم قراءة {fileName}</span>
+                  <button onClick={(e) => { e.stopPropagation(); setFileStatus(""); setFileName(""); setInputText(""); }}
+                    style={{ padding: "3px 10px", background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 6, color: S.red, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: S.font }}>✕</button>
+                </div>
+              ) : (
+                <>
+                  <div style={{ fontSize: 28, marginBottom: 6 }}>📎</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: S.dark, fontFamily: S.font }}>اسحب الملف أو اضغط للرفع</div>
+                  <div style={{ fontSize: 11, color: S.gray, marginTop: 4, fontFamily: S.font, display: "flex", justifyContent: "center", gap: 6, flexWrap: "wrap" }}>
+                    {["PDF", "Excel", "Word", "CSV", "TXT"].map(t => (
+                      <span key={t} style={{ padding: "2px 8px", background: `${S.dark}06`, borderRadius: 4, fontSize: 10, fontWeight: 600 }}>{t}</span>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
           <textarea value={inputText} onChange={e => setInputText(e.target.value)} dir="rtl"
             placeholder={`الصق BOQ أو اكتب وصف المشروع...
